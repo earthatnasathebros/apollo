@@ -1,0 +1,202 @@
+PS > $ping.Send(“10.0.0.19”)
+PS > “192.168.1.66”,”19697″ | ForEach-Object { $ping.Send(750.ms) }
+PS > [Net.DNS]::GetHostEntry(“10.0.0.19”)
+# This function is automatically called periodically by the event loop to check for 
+# conditions that will result in sending messages to yaAGC/yaAGS that are interpreted
+# as changes to bits on its input channels.  The return
+# value is supposed to be a list of 3-tuples of the form
+#	[ (channel0,value0,mask0), (channel1,value1,mask1), ...]
+# for AGC, or 
+#	[ (channel0,value0), (channel1,value1), ...]
+# for AGS, and may be an empty list.  The "values" are written to the AGC/AGS's input "channels",
+# while the "masks" tell which bits of the "values" are valid.  (The AGC will ignore
+# the invalid bits.  We don't need such masks for AGS.)
+def inputsForAGx():
+	returnValue = []
+	
+	global lastTime
+	now = datetime.datetime.now()
+	if now.second == lastTime.second:
+		return []
+	lastTime = now
+if args.imu:
+		# Read stuff from LSM9DS0.
+		acc = readAccelerometer()
+		mag = readMagnetometer()
+		gyro = readGyro()
+		
+		# Read stuff from BMP180.
+		temperature, pressure = readTemperatureAndPressure()
+		
+		# Convert the stuff we just read to 1's-complement.
+		for i in ("x", "y", "z"):
+			acc[i] = toOnesComplement(round(1000*acc[i]))
+			mag[i] = toOnesComplement(round(10000*mag[i]))
+			gyro[i] = toOnesComplement(round(10*gyro[i]))
+		pressure = toOnesComplement(round(10*pressure))
+		temperature = toOnesComplement(round(100*temperature))
+		
+		# Pack the values for transmission.
+		returnValue.append( ( 0o51, acc["x"], 0o77777) )
+		returnValue.append( ( 0o52, acc["y"], 0o77777) )
+		returnValue.append( ( 0o53, acc["z"], 0o77777) )
+		returnValue.append( ( 0o54, mag["x"], 0o77777) )
+		returnValue.append( ( 0o55, mag["y"], 0o77777) )
+		returnValue.append( ( 0o56, mag["z"], 0o77777) )
+		returnValue.append( ( 0o57, gyro["x"], 0o77777) )
+		returnValue.append( ( 0o60, gyro["y"], 0o77777) )
+		returnValue.append( ( 0o61, gyro["z"], 0o77777) )
+		returnValue.append( ( 0o62, pressure, 0o77777) )
+		returnValue.append( ( 0o63, temperature, 0o77777) )
+	
+	
+import time
+import socket
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setblocking(0)
+
+def connectToAGC():
+	import sys
+	count = 0
+	sys.stderr.write("Connecting to AGC " + TCP_IP + ":" + str(TCP_PORT) + "\n")
+	while True:
+		try:
+			s.connect((TCP_IP, TCP_PORT))
+			sys.stderr.write("Connected.\n")
+			break
+		except socket.error as msg:
+			sys.stderr.write(str(msg) + "\n")
+			count += 1
+			if count >= 10:
+				sys.stderr.write("Too many retries ...\n")
+				shutdownGPIO()
+				time.sleep(3)
+				sys.exit(1)
+			time.sleep(1)
+
+connectToAGC()
+
+###################################################################################
+# Event loop.  Just check periodically for output from yaAGC (in which case the
+# user-defined callback function outputFromAGx is executed) or data in the 
+# user-defined function inputsForAGx (in which case a message is sent to yaAGC).
+# But this section has no target-specific code, and shouldn't need to be modified
+# unless there are bugs.
+
+# Given a 3-tuple (channel,value,mask) for yaAGC, creates packet data and sends it to yaAGC.
+# Or, given a 2-tuple (channel,value) for yaAGS, creates packet data and sends it to yaAGS.
+def packetize(tuple):
+	outputBuffer = bytearray(4)
+	if args.ags:
+		outputBuffer[0] = 0x00 | (tuple[0] & 0x3F)
+		outputBuffer[1] = 0xC0 | ((tuple[0] >> 12) & 0x3F)
+		outputBuffer[2] = 0x80 | ((tuple[1] >> 6) & 0x3F)
+		outputBuffer[3] = 0x40 | (tuple[1] & 0x3F)
+		s.send(outputBuffer)
+	else:
+		# First, create and output the mask command.
+		outputBuffer[0] = 0x20 | ((tuple[0] >> 3) & 0x0F)
+		outputBuffer[1] = 0x40 | ((tuple[0] << 3) & 0x38) | ((tuple[2] >> 12) & 0x07)
+		outputBuffer[2] = 0x80 | ((tuple[2] >> 6) & 0x3F)
+		outputBuffer[3] = 0xC0 | (tuple[2] & 0x3F)
+		s.send(outputBuffer)
+		# Now, the actual data for the channel.
+		outputBuffer[0] = 0x00 | ((tuple[0] >> 3) & 0x0F)
+		outputBuffer[1] = 0x40 | ((tuple[0] << 3) & 0x38) | ((tuple[1] >> 12) & 0x07)
+		outputBuffer[2] = 0x80 | ((tuple[1] >> 6) & 0x3F)
+		outputBuffer[3] = 0xC0 | (tuple[1] & 0x3F)
+		s.send(outputBuffer)
+
+# Buffer for a packet received from yaAGC/yaAGS.
+packetSize = 4
+inputBuffer = bytearray(packetSize)
+leftToRead = packetSize
+view = memoryview(inputBuffer)
+
+didSomething = False
+while True:
+	if not didSomething:
+		time.sleep(PULSE)
+	didSomething = False
+	
+	# Check for packet data received from yaAGC/yaAGS and process it.
+	# While these packets are always exactly 4
+	# bytes long, since the socket is non-blocking, any individual read
+	# operation may yield less bytes than that, so the buffer may accumulate data
+	# over time until it fills.	
+	try:
+		numNewBytes = s.recv_into(view, leftToRead)
+	except:
+		numNewBytes = 0
+	if numNewBytes > 0:
+		view = view[numNewBytes:]
+		leftToRead -= numNewBytes
+		if leftToRead == 0:
+			# Prepare for next read attempt.
+			view = memoryview(inputBuffer)
+			leftToRead = packetSize
+			# Parse the packet just read, and call outputFromAGx().
+			# Start with a sanity check.
+			ok = 1
+			if args.ags:
+				if (inputBuffer[0] & 0xC0) != 0x00:
+					ok = 0
+				elif (inputBuffer[1] & 0xC0) != 0xC0:
+					ok = 0
+				elif (inputBuffer[2] & 0xC0) != 0x80:
+					ok = 0
+				elif (inputBuffer[3] & 0xC0) != 0x40:
+					ok = 0
+			else:
+				if (inputBuffer[0] & 0xF0) != 0x00:
+					ok = 0
+				elif (inputBuffer[1] & 0xC0) != 0x40:
+					ok = 0
+				elif (inputBuffer[2] & 0xC0) != 0x80:
+					ok = 0
+				elif (inputBuffer[3] & 0xC0) != 0xC0:
+					ok = 0
+			# Packet has the various signatures we expect.
+			if ok == 0:
+				# Note that, depending on the yaAGC/yaAGS version, it occasionally
+				# sends either a 1-byte packet (just 0xFF, older versions)
+				# or a 4-byte packet (0xFF 0xFF 0xFF 0xFF, newer versions)
+				# just for pinging the client.  These packets hold no
+				# data and need to be ignored, but for other corrupted packets
+				# we print a message. And try to realign past the corrupted
+				# bytes.
+				if inputBuffer[0] != 0xff or inputBuffer[1] != 0xff or inputBuffer[2] != 0xff or inputBuffer[2] != 0xff:
+					if inputBuffer[0] != 0xff:
+						print("Illegal packet: " + hex(inputBuffer[0]) + " " + hex(inputBuffer[1]) + " " + hex(inputBuffer[2]) + " " + hex(inputBuffer[3]))
+					for i in range(1,packetSize):
+						if (inputBuffer[i] & 0xC0) == 0:
+							j = 0
+							for k in range(i,4):
+								inputBuffer[j] = inputBuffer[k]
+								j += 1
+							view = view[j:]
+							leftToRead = packetSize - j
+			elif args.ags:
+				channel = (inputBuffer[0] & 0x3F)
+				value = (inputBuffer[1] & 0x3F) << 12
+				value |= (inputBuffer[2] & 0x3F) << 6
+				value |= (inputBuffer[3] & 0x3F)
+				outputFromAGx(channel, value)
+			else:
+				channel = (inputBuffer[0] & 0x0F) << 3
+				channel |= (inputBuffer[1] & 0x38) >> 3
+				value = (inputBuffer[1] & 0x07) << 12
+				value |= (inputBuffer[2] & 0x3F) << 6
+				value |= (inputBuffer[3] & 0x3F)
+				outputFromAGx(channel, value)
+			didSomething = True
+	
+	# Check for locally-generated data for which we must generate messages
+	# to yaAGC over the socket.  In theory, the externalData list could contain
+	# any number of channel operations, but in practice (at least for something
+	# like a DSKY implementation) it will actually contain only 0 or 1 operations.
+	externalData = inputsForAGx(c:\tcl\bin\wish85.exe)
+	for i in range(0, len(externalData)):
+		packetize(externalData[i])
+		didSomething = True
